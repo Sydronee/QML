@@ -1,30 +1,46 @@
 import os
+import multiprocessing
 import glob
 import cv2
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.transforms as T
 import pennylane as qml
 from sklearn.model_selection import train_test_split
 import string
+from tqdm import tqdm
+
+# Force OpenMP and PyTorch to use all CPU cores
+cpu_count = os.cpu_count() or 1
+os.environ["OMP_NUM_THREADS"] = str(cpu_count)
+torch.set_num_threads(cpu_count)
+cv2.setNumThreads(0) 
 
 # 1. Label Mapper
 ALPHABET = string.digits + string.ascii_letters
 CHAR_MAPPING = {char: idx for idx, char in enumerate(ALPHABET)}
 
 def label_to_int(char):
-    """Map the 62 alphanumeric characters to integer targets (0 to 61)."""
     return CHAR_MAPPING.get(char, 0)
 
-# 2. Data Loader
+# 2. Data Loader with Augmentation
 class CaptchaDataset(Dataset):
     def __init__(self, data_dir="Large_Captcha_Dataset"):
         self.image_paths = glob.glob(os.path.join(data_dir, "*.png"))
         if not self.image_paths:
             self.image_paths = glob.glob(os.path.join(data_dir, "*.jpg"))
             
+        # Data Augmentation to help the model generalize
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.RandomRotation(5),      # Small rotations to handle slanted text
+            T.ColorJitter(brightness=0.1, contrast=0.1), 
+            T.ToTensor(),             # This also handles the /255.0 normalization
+        ])
+            
     def __len__(self):
-        return len(self.image_paths) * 5 # 5 segments per image
+        return len(self.image_paths) * 5 
         
     def __getitem__(self, idx):
         img_idx = idx // 5
@@ -33,165 +49,177 @@ class CaptchaDataset(Dataset):
         img_path = self.image_paths[img_idx]
         filename = os.path.basename(img_path).split('.')[0]
         
-        # Parse corresponding character
         char = filename[char_idx] if char_idx < len(filename) else 'A'
         label = label_to_int(char)
         
-        # Load and grayscale
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return torch.zeros((1, 32, 32)), torch.tensor(label, dtype=torch.long)
             
-        # Resize to (160, 32) so it can be sliced evenly into 5 parts width-wise
-        img = cv2.resize(img, (160, 32))
+        h, w = img.shape
+        chunk_w = w // 5
+        segment = img[:, char_idx * chunk_w : (char_idx + 1) * chunk_w]
+        segment = cv2.resize(segment, (32, 32))
         
-        # Slice segment (32x32)
-        segment = img[:, char_idx*32:(char_idx+1)*32]
-        
-        # Normalize and convert to tensor
-        segment = segment.astype("float32") / 255.0
-        segment_tensor = torch.tensor(segment).unsqueeze(0) # (1, 32, 32)
+        # Apply transforms (includes normalization)
+        segment_tensor = self.transform(segment) 
         
         return segment_tensor, torch.tensor(label, dtype=torch.long)
 
-# 3. Classical Encoder & Quantum Layer
-n_qubits = 6
-dev = qml.device("lightning.qubit", wires=n_qubits)
+# 3. Hybrid Model
+n_qubits = 8
+dev = qml.device("default.qubit", wires=n_qubits)
 
-@qml.qnode(dev, interface="torch")
+@qml.qnode(dev, interface="torch", diff_method="backprop")
 def quantum_circuit(inputs, weights):
-    # Encode classical inputs into quantum state
-    # PennyLane supports batched inputs dynamically
     qml.AngleEmbedding(inputs, wires=range(n_qubits))
-    
-    # Trainable quantum layers
     qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
-    
-    # Return probabilities of computational basis states
-    return qml.probs(wires=range(n_qubits))
+    return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
 class HybridQMLModel(nn.Module):
-    def __init__(self, n_quantum_layers=2):
+    def __init__(self, n_quantum_layers=4):
         super().__init__()
-        # Classical CNN Encoder
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
             nn.ReLU(),
-            nn.MaxPool2d(2), # 16x16
-            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.MaxPool2d(2), 
+            
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.MaxPool2d(2), # 8x8
+            nn.MaxPool2d(2), 
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2), 
+            
             nn.Flatten(),
-            nn.Linear(16 * 8 * 8, 32),
+            nn.Linear(64 * 4 * 4, 512),
             nn.ReLU(),
-            nn.Linear(32, n_qubits) # Squeeze to feature vector matching qubits
+            nn.Linear(512, n_qubits)
         )
         
-        # Quantum weights
-        self.q_weights = nn.Parameter(torch.randn(n_quantum_layers, n_qubits))
+        self.q_weights = nn.Parameter(torch.empty(n_quantum_layers, n_qubits))
+        torch.nn.init.uniform_(self.q_weights, a=-0.1, b=0.1)
+        self.classifier = nn.Linear(n_qubits, 62)
         
     def forward(self, x):
-        # x is the batch of images [batch_size, 1, 32, 32]
-        features = self.encoder(x) # Should output [batch_size, 6]
-        
-        # Scale features for the quantum circuit
+        features = self.encoder(x)
         features = torch.tanh(features) * torch.pi 
+        q_out = quantum_circuit(features, self.q_weights)
         
-        # Process through quantum layer (batch processing)
-        # Note: qml.qnode in torch typically expects a single input or has vmap support,
-        # but manual stacking is safe for simple proofs of concept.
-        q_out = torch.stack([quantum_circuit(f, self.q_weights) for f in features])
-        
-        # Slice to 62 to match A-Z, 0-9
-        return q_out[:, :62]
+        if isinstance(q_out, tuple) or isinstance(q_out, list):
+            q_out = torch.stack(q_out, dim=-1)
+        elif q_out.ndim == 1:
+            q_out = q_out.unsqueeze(0)
+            
+        return self.classifier(q_out.float())
 
-# 4. Training Loop
-def train_model(data_dir="Large_Captcha_Dataset", epochs=5, batch_size=16, lr=0.01, debug_mode=False):
+# 4. Training Loop with Snapshots
+def train_model(data_dir="Large_Captcha_Dataset", epochs=15, batch_size=128, lr=0.0005, debug_mode=False):
     dataset = CaptchaDataset(data_dir)
     if len(dataset) == 0:
-        print(f"No images found in {data_dir}. Please add some CAPTCHA images to train.")
+        print(f"No images found in {data_dir}.")
         return
         
-    # Data Splitting
     indices = list(range(len(dataset)))
-    
     if debug_mode:
-        print("DEBUG MODE ON: Limiting dataset to 100 samples.")
-        indices = indices[:100]
+        print("DEBUG MODE ON: Limiting dataset to 100,000 samples.")
+        indices = indices[:100000]
         
     train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
-    
     train_dataset = Subset(dataset, train_idx)
     test_dataset = Subset(dataset, test_idx)
     
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=4, 
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=4, 
-        pin_memory=True
-    )
+    num_workers = max(1, min(os.cpu_count(), 16))
     
-    model = HybridQMLModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                              num_workers=num_workers, prefetch_factor=4, persistent_workers=True, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                             num_workers=num_workers, prefetch_factor=4, persistent_workers=True, pin_memory=True)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    model = HybridQMLModel().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     
-    print(f"Starting Training on {len(train_dataset)} training samples...")
-    for epoch in range(epochs):
+    # Scheduler: Reduces learning rate when the loss plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+
+    best_acc = 0.0
+    start_epoch = 0
+
+    # Optional: Load checkpoint if it exists
+    if os.path.exists("qml_latest.pth"):
+        print("Loading existing checkpoint...")
+        checkpoint = torch.load("qml_latest.pth")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_acc = checkpoint.get('best_acc', 0.0)
+        print(f"Resuming from epoch {start_epoch}")
+
+    print(f"Starting Training on {len(train_dataset)} samples...")
+    for epoch in range(start_epoch, epochs):
         model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
+        total_loss, correct, total = 0, 0, 0
         
-        for batch_idx, (images, labels) in enumerate(train_loader):
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for batch_idx, (images, labels) in enumerate(loop):
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad()
             
-            # Forward pass
             outputs = model(images)
             loss = criterion(outputs, labels)
-            
-            # Backward pass
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            
-            # Calculate accuracy
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            
-            # Progress Feedback
-            if (batch_idx + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
+            loop.set_postfix(loss=loss.item(), acc=100.*correct/total)
             
         avg_loss = total_loss / len(train_loader)
         train_accuracy = 100 * correct / total
         
-        # Evaluation Phase
+        # Step the scheduler
+        scheduler.step(avg_loss)
+
+        # Evaluation
         model.eval()
-        test_correct = 0
-        test_total = 0
+        test_correct, test_total = 0, 0
         with torch.no_grad():
             for images, labels in test_loader:
+                images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 outputs = model(images)
                 _, predicted = torch.max(outputs.data, 1)
                 test_total += labels.size(0)
                 test_correct += (predicted == labels).sum().item()
         
         test_accuracy = 100 * test_correct / test_total if test_total > 0 else 0
-        
-        print(f"Epoch {epoch+1}/{epochs} Summary - Loss: {avg_loss:.4f} - Train Acc: {train_accuracy:.2f}% - Test Acc: {test_accuracy:.2f}%\n")
+        print(f"Epoch {epoch+1} Summary - Loss: {avg_loss:.4f} - Train: {train_accuracy:.2f}% - Test: {test_accuracy:.2f}%")
+
+        # SAVE SNAPSHOTS
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_acc': best_acc,
+        }
+        torch.save(checkpoint, "qml_latest.pth")
+
+        if test_accuracy > best_acc:
+            best_acc = test_accuracy
+            torch.save(checkpoint, "qml_best.pth")
+            print(f"New Best Model Saved! Accuracy: {test_accuracy:.2f}%")
         
     print("Training Complete!")
     return model
 
 if __name__ == "__main__":
-    train_model()
+    train_model(debug_mode=True, epochs=30) 
