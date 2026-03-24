@@ -3,15 +3,18 @@ import glob
 import cv2
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import pennylane as qml
+from sklearn.model_selection import train_test_split
+import string
 
 # 1. Label Mapper
+ALPHABET = string.digits + string.ascii_letters
+CHAR_MAPPING = {char: idx for idx, char in enumerate(ALPHABET)}
+
 def label_to_int(char):
-    """Map the 4 most common characters to quantum states (0 to 3)."""
-    mapping = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
-    # Fallback to 0 if character is not A, B, C, or D for proof of concept
-    return mapping.get(char.upper(), 0)
+    """Map the 62 alphanumeric characters to integer targets (0 to 61)."""
+    return CHAR_MAPPING.get(char, 0)
 
 # 2. Data Loader
 class CaptchaDataset(Dataset):
@@ -52,18 +55,19 @@ class CaptchaDataset(Dataset):
         return segment_tensor, torch.tensor(label, dtype=torch.long)
 
 # 3. Classical Encoder & Quantum Layer
-n_qubits = 2
-dev = qml.device("default.qubit", wires=n_qubits)
+n_qubits = 6
+dev = qml.device("lightning.qubit", wires=n_qubits)
 
 @qml.qnode(dev, interface="torch")
 def quantum_circuit(inputs, weights):
     # Encode classical inputs into quantum state
+    # PennyLane supports batched inputs dynamically
     qml.AngleEmbedding(inputs, wires=range(n_qubits))
     
     # Trainable quantum layers
     qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
     
-    # Return probabilities of computational basis states (|00>, |01>, |10>, |11>)
+    # Return probabilities of computational basis states
     return qml.probs(wires=range(n_qubits))
 
 class HybridQMLModel(nn.Module):
@@ -80,45 +84,73 @@ class HybridQMLModel(nn.Module):
             nn.Flatten(),
             nn.Linear(16 * 8 * 8, 32),
             nn.ReLU(),
-            nn.Linear(32, 2) # Squeeze to 2-element feature vector
+            nn.Linear(32, n_qubits) # Squeeze to feature vector matching qubits
         )
         
         # Quantum weights
         self.q_weights = nn.Parameter(torch.randn(n_quantum_layers, n_qubits))
         
     def forward(self, x):
-        # Classical forward
-        features = self.encoder(x)
-        features = torch.tanh(features) * torch.pi # Scale for AngleEmbedding
+        # x is the batch of images [batch_size, 1, 32, 32]
+        features = self.encoder(x) # Should output [batch_size, 6]
+        
+        # Scale features for the quantum circuit
+        features = torch.tanh(features) * torch.pi 
         
         # Process through quantum layer (batch processing)
         # Note: qml.qnode in torch typically expects a single input or has vmap support,
         # but manual stacking is safe for simple proofs of concept.
         q_out = torch.stack([quantum_circuit(f, self.q_weights) for f in features])
         
-        return q_out
+        # Slice to 62 to match A-Z, 0-9
+        return q_out[:, :62]
 
 # 4. Training Loop
-def train_model(data_dir="Large_Captcha_Dataset", epochs=5, batch_size=16, lr=0.01):
+def train_model(data_dir="Large_Captcha_Dataset", epochs=5, batch_size=16, lr=0.01, debug_mode=False):
     dataset = CaptchaDataset(data_dir)
     if len(dataset) == 0:
         print(f"No images found in {data_dir}. Please add some CAPTCHA images to train.")
         return
         
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Data Splitting
+    indices = list(range(len(dataset)))
+    
+    if debug_mode:
+        print("DEBUG MODE ON: Limiting dataset to 100 samples.")
+        indices = indices[:100]
+        
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
+    
+    train_dataset = Subset(dataset, train_idx)
+    test_dataset = Subset(dataset, test_idx)
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True
+    )
     
     model = HybridQMLModel()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     
-    model.train()
-    print("Starting Training...")
+    print(f"Starting Training on {len(train_dataset)} training samples...")
     for epoch in range(epochs):
+        model.train()
         total_loss = 0
         correct = 0
         total = 0
         
-        for batch_idx, (images, labels) in enumerate(dataloader):
+        for batch_idx, (images, labels) in enumerate(train_loader):
             optimizer.zero_grad()
             
             # Forward pass
@@ -136,9 +168,27 @@ def train_model(data_dir="Large_Captcha_Dataset", epochs=5, batch_size=16, lr=0.
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
-        avg_loss = total_loss / len(dataloader)
-        accuracy = 100 * correct / total
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Accuracy: {accuracy:.2f}%")
+            # Progress Feedback
+            if (batch_idx + 1) % 10 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] Step [{batch_idx+1}/{len(train_loader)}] Loss: {loss.item():.4f}")
+            
+        avg_loss = total_loss / len(train_loader)
+        train_accuracy = 100 * correct / total
+        
+        # Evaluation Phase
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for images, labels in test_loader:
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                test_total += labels.size(0)
+                test_correct += (predicted == labels).sum().item()
+        
+        test_accuracy = 100 * test_correct / test_total if test_total > 0 else 0
+        
+        print(f"Epoch {epoch+1}/{epochs} Summary - Loss: {avg_loss:.4f} - Train Acc: {train_accuracy:.2f}% - Test Acc: {test_accuracy:.2f}%\n")
         
     print("Training Complete!")
     return model

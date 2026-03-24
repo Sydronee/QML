@@ -1,17 +1,11 @@
 import pennylane as qml
-from pennylane import numpy as np
 
-# We use 2 wires, but we will manually treat them as 3-level systems
-dev = qml.device("default.qubit", wires=2)
+n_qubits = 6
+# Switch back to default.qubit for full backprop support
+dev = qml.device("default.qubit", wires=n_qubits)
 
-@qml.qnode(dev)
-def qudit_classifier(inputs, weights):
-    # Encoding: Instead of just |0> and |1>, we use a 3x3 Unitary 
-    # to move our state into a "Qutrit" space.
-    for i in range(len(inputs)):
-        # Custom 3x3 rotation matrix for qutrit encoding
-        qml.QubitUnitary(my_qutrit_rotation(inputs[i]), wires=i)
-    
-    return qml.probs(wires=[0, 1])
-
-print("Environment Ready. Qudit logic initialized.")
+@qml.qnode(dev, interface="torch", diff_method="backprop")
+def quantum_circuit(inputs, weights):
+    qml.AngleEmbedding(inputs, wires=range(n_qubits))
+    qml.BasicEntanglerLayers(weights, wires=range(n_qubits))
+    return qml.probs(wires=range(n_qubits))
