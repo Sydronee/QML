@@ -3,3 +3,5 @@ Large_Captcha_Dataset
 archive.zip
 __pycache__/
 *.pth
+quantum_results_gallery.png
+processed_data.pt
