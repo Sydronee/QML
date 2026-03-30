@@ -17,6 +17,7 @@ cycler==0.12.1
 debugpy==1.8.20
 decorator==5.2.1
 diastatic-malt==2.15.2
+dill==0.4.1
 executing==2.2.1
 filelock==3.25.2
 fonttools==4.62.1
@@ -63,6 +64,7 @@ nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
 opencv-python==4.13.0.92
 packaging==26.0
+pandas==3.0.1
 parso==0.8.6
 pennylane==0.44.1
 pennylane_lightning==0.44.0
@@ -73,11 +75,15 @@ prompt_toolkit==3.0.52
 psutil==7.2.2
 ptyprocess==0.7.0
 pure_eval==0.2.3
+pydot==4.0.1
 Pygments==2.19.2
+pylatexenc==2.10
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 pyzmq==27.1.0
+qiskit==2.3.1
+qiskit-aer==0.17.2
 requests==2.32.5
 rich==14.3.3
 rustworkx==0.17.1
@@ -85,10 +91,12 @@ safetensors==0.7.0
 scikit-learn==1.8.0
 scipy==1.17.1
 scipy-openblas32==0.3.31.188.0
+seaborn==0.13.2
 setuptools==82.0.1
 shellingham==1.5.4
 six==1.17.0
 stack-data==0.6.3
+stevedore==5.7.0
 sympy==1.14.0
 termcolor==3.3.0
 threadpoolctl==3.6.0
