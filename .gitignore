@@ -1,1 +1,33 @@
-qudit_env
+qudit_env/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Project datasets / model artifacts
+Large_Captcha_Dataset/
+archive.zip
+*.pth
+*.pt
+*.ckpt
+
+# Generated outputs
+*.pdf
+quantum_results_gallery.png
+quantum_gates_unrolled.png
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
